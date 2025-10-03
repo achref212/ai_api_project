@@ -1,88 +1,120 @@
-from fastapi import FastAPI, HTTPException
-from app.models import AnalyzeRequest, AnalyzeResponse, Suggestion
-from app.crew import create_crew
-from app.llms import get_groq_llm
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-from typing import List, Dict
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Literal, Optional
+import json, re
 
-app = FastAPI(title="AI Suggestions API", description="CrewAI-powered analysis with dynamic LLM orchestration",
-              version="1.0.1")
+from .models import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    TripPlan,
+    CultureInfo,
+    FoodSuggestions,
+    UnreadSummary,
+)
+from .crew import run_pipeline
+
+app = FastAPI(
+    title="CrewAI Travel Concierge API",
+    version="1.0.0",
+    description=(
+        "Analyze user conversations and generate a short trip plan (LLM1), "
+        "culture & etiquette (LLM2), food ideas (LLM3), and an unread summary (LLM4)."
+    ),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-# Orchestrator: Classify topics and select active agents + LLM per agent
-def orchestrate_llms(messages: List[Dict]) -> Dict[str, Dict[str, str]]:
-    conversation = "\n".join([f"{msg['sender']}: {msg['content']}" for msg in messages])
-    llm = get_groq_llm()  # Use quick Groq for classification
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-    prompt = ChatPromptTemplate.from_template(
-        """Analyze this conversation and output JSON with keys for each topic: {"travel": {"active": true/false, "llm": "groq|gemini"}, "culture": {...}, "restaurant": {...}}.
-        - travel: active if destinations/trips mentioned; llm="gemini" for creative planning.
-        - culture: active if places/history mentioned; llm="groq" for factual info.
-        - restaurant: active if food/dining discussed; llm="gemini" for recommendations.
-        Do not include summary (always groq). Conversation: {conversation}"""
+
+def _extract_jsonish(blob) -> dict | None:
+    """Return a dict from string/dict/list that may contain code fences or extra text."""
+    if not blob:
+        return None
+    if isinstance(blob, dict):
+        return blob
+    if isinstance(blob, list):
+        for item in blob:
+            if isinstance(item, dict):
+                return item
+            if isinstance(item, str):
+                d = _extract_jsonish(item)
+                if d:
+                    return d
+        return None
+
+    if isinstance(blob, str):
+        s = blob.strip()
+        # strip ```json ... ``` or ``` ... ```
+        if s.startswith("```"):
+            s = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+        # find first {...}
+        m = re.search(r"\{.*\}", s, re.S)
+        if not m:
+            return None
+        json_str = m.group(0)
+        try:
+            return json.loads(json_str)
+        except Exception:
+            return None
+    return None
+
+
+@app.post("/api/v1/analyze", response_model=AnalyzeResponse)
+def analyze(
+    req: AnalyzeRequest,
+    provider_sequence: Optional[List[Literal["gemini", "groq"]]] = Query(
+        default=None,
+        description="Provider list for [planner, culture, food, summary]; defaults to all gemini.",
+    ),
+):
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="messages cannot be empty")
+
+    provider_sequence = provider_sequence or ["gemini", "gemini", "gemini", "gemini"]
+
+    raw_outputs = run_pipeline(
+        messages=[m.dict() for m in req.messages],
+        locale=req.locale or "en",
+        destination_hint=req.destination_hint,
+        provider_sequence=provider_sequence,
     )
-    chain = prompt | llm | JsonOutputParser()
 
-    try:
-        result = chain.invoke({"conversation": conversation})
-        # Ensure all keys present
-        for key in ["travel", "culture", "restaurant"]:
-            if key not in result:
-                result[key] = {"active": False, "llm": "groq"}
-        return result
-    except Exception:
-        # Fallback: Minimal activation
-        return {
-            "travel": {"active": False, "llm": "gemini"},
-            "culture": {"active": False, "llm": "groq"},
-            "restaurant": {"active": False, "llm": "gemini"}
-        }
+    def _coerce(label: str, model):
+        blob = raw_outputs.get(label)
+        data = _extract_jsonish(blob)
+        if not data:
+            return None
+        try:
+            return model(**data)
+        except Exception:
+            return None
 
+    resp = AnalyzeResponse(
+        trip_plan=_coerce("trip_plan", TripPlan),
+        culture=_coerce("culture", CultureInfo),
+        food=_coerce("food", FoodSuggestions),
+        unread_summary=_coerce("unread_summary", UnreadSummary),
+        raw_outputs=raw_outputs,
+    )
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-async def analyze_conversation(request: AnalyzeRequest):
-    try:
-        # Orchestrate: Get active configs with LLM choices
-        active_configs = orchestrate_llms([msg.dict() for msg in request.messages])
+    # Fallback: if all are None, try to parse the aggregated 'raw'
+    if not any([resp.trip_plan, resp.culture, resp.food, resp.unread_summary]):
+        raw_blob = raw_outputs.get("raw")
+        data = _extract_jsonish(raw_blob)
+        if isinstance(data, dict) and {"summary", "action_items"} <= set(data.keys()):
+            try:
+                resp.unread_summary = UnreadSummary(**data)
+            except Exception:
+                pass
 
-        # Create and run dynamic crew
-        crew = create_crew(request.messages, active_configs)
-        result = crew.kickoff()  # Fixed: Changed from process() to kickoff()
-
-        # Parse outputs with explicit mapping (only non-'No' content)
-        outputs = {}
-        for task in crew.tasks:
-            if hasattr(task, 'output') and task.output.raw:
-                raw = task.output.raw.strip()
-                if "No" not in raw:
-                    agent_type = task.agent.role.lower().split()[
-                        0]  # e.g., "travel", "culture", "food" -> "restaurant", "conversation" -> "summary"
-                    if agent_type == "food":
-                        agent_type = "restaurant"
-                    elif agent_type == "conversation":
-                        agent_type = "summary"
-                    outputs[agent_type] = raw
-
-        # Build suggestions
-        suggestions: List[Suggestion] = []
-        if "travel" in outputs:
-            suggestions.append(Suggestion(type="travel", content=outputs["travel"]))
-        if "culture" in outputs:
-            suggestions.append(Suggestion(type="culture", content=outputs["culture"]))
-        if "restaurant" in outputs:
-            suggestions.append(Suggestion(type="restaurant", content=outputs["restaurant"]))
-
-        summary = outputs.get("summary", "No summary available due to processing error.")
-
-        return AnalyzeResponse(
-            suggestions=suggestions,
-            summary=summary
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI processing failed: {str(e)}")
-
-
-@app.get("/")
-async def root():
-    return {"message": "AI Suggestions API with Dynamic LLM Orchestration is running. Use /docs for Swagger."}
+    return resp

@@ -1,8 +1,11 @@
-crewai-tools
+protobuf
 fastapi==0.115.0
 uvicorn==0.30.6
-crewai==0.51.1
+crewai[tools]==0.51.1
 langchain-groq==0.2.0
-langchain-google-genai==1.1.0
+langchain-google-genai==2.1.12
+langchain-community==0.3.0  # Added: For stable DuckDuckGo tool
 pydantic==2.9.2
-python-dotenv==1.0.1  # Optional for env vars
+python-dotenv==1.0.1
+langchain-core==0.3.0
+duckduckgo-search==8.1.1
