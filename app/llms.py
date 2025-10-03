@@ -1,35 +1,47 @@
-from groq import Groq
+from typing import List, Dict
+import os
+from dotenv import load_dotenv
+
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
-from crewai_tools import BaseTool
-import os
+from crewai.tools import BaseTool  # Kept for completeness, but no tools used
 
-# Hardcoded keys (use .env in prod: from dotenv import load_dotenv; load_dotenv())
-GROQ_API_KEY = "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"
-GEMINI_API_KEY = "AIzaSyCGu2_r5CogQ1AIMAaUTT-yCzjso1aJnBA"
+# Load environment variables from .env file
+load_dotenv()
 
-def get_groq_llm(model_name="llama3.1-70b-versatile"):
-    """Groq LLM for fast inference."""
-    client = Groq(api_key=GROQ_API_KEY)
+# API Keys from .env
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Validate keys
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is required. Please set it in .env file.")
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is required. Please set it in .env file.")
+
+def get_groq_llm(model_name="groq/llama-3.3-70b-versatile"):
+    """Groq LLM for fast, factual tasks."""
     return ChatGroq(
         groq_api_key=GROQ_API_KEY,
         model_name=model_name,
         temperature=0.7,
     )
 
-def get_gemini_llm(model_name="gemini-1.5-pro"):
-    """Gemini LLM for summarization."""
+def get_gemini_llm(model_name="gemini-2.5-flash"):
+    """Gemini 2.5 Flash for creative, detailed tasks."""
     return ChatGoogleGenerativeAI(
         model=model_name,
         google_api_key=GEMINI_API_KEY,
-        temperature=0.5,
+        temperature=0.7,
     )
 
-# Optional: Custom tool for message formatting (not used here for simplicity)
-class MessageFormatterTool(BaseTool):
-    name: str = "Message Formatter"
-    description: str = "Formats conversation messages into a readable string."
+def get_llm(provider: str):
+    """Dynamic LLM selector: 'groq' or 'gemini'."""
+    if provider.lower() == "groq":
+        return get_groq_llm()
+    elif provider.lower() == "gemini":
+        return get_gemini_llm()
+    else:
+        raise ValueError(f"Invalid LLM provider: {provider}. Use 'groq' or 'gemini'.")
 
-    def _run(self, messages: List[Dict[str, str]]) -> str:
-        formatted = "\n".join([f"{msg['sender']}: {msg['content']}" for msg in messages])
-        return formatted
+# No tools used to avoid errors

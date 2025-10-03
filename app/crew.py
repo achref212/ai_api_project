@@ -1,84 +1,81 @@
 from crewai import Agent, Task, Crew
-from crewai_tools import Tool
-from app.llms import get_groq_llm, get_gemini_llm
+from app.llms import get_llm
 from app.models import Message
-from typing import List
+from typing import List, Dict
 
-# Tools (extend as needed; here, a simple one for formatting messages)
-from app.llms import MessageFormatterTool
-
-def create_crew(messages: List[Message]) -> Crew:
+def create_crew(messages: List[Message], active_configs: Dict[str, Dict[str, str]]) -> Crew:
     # Format input conversation
     conversation = "\n".join([f"{msg.sender}: {msg.content}" for msg in messages])
 
-    # LLMs
-    groq_llm = get_groq_llm()
-    gemini_llm = get_gemini_llm()
+    # Agents (only instantiate if active, with dynamic LLM)
+    agents = {}
+    tasks = []
 
-    # Agents
-    travel_agent = Agent(
-        role="Travel Planner",
-        goal="Analyze the conversation for travel discussions (e.g., destinations like Paris) and suggest the best itinerary if relevant.",
-        backstory="You are an expert travel planner who creates detailed, personalized plans based on user chats.",
-        llm=groq_llm,
-        tools=[MessageFormatterTool()],  # Optional tool for formatting
-        verbose=True,
-    )
+    # Travel Agent (Gemini for creative planning)
+    if active_configs.get("travel", {}).get("active", False):
+        agents["travel"] = Agent(
+            role="Travel Planner",
+            goal="Analyze the conversation for travel discussions and suggest the best itinerary if relevant.",
+            backstory="You are an expert travel planner who creates detailed, personalized plans based on user chats.",
+            llm=get_llm(active_configs["travel"]["llm"]),
+            verbose=True,
+        )
+        tasks.append(Task(
+            description=f"Examine this conversation: {conversation}. If travel to a place like Paris is discussed, generate a detailed plan (itinerary, tips). Output only if relevant, else 'No travel suggestion'.",
+            agent=agents["travel"],
+            expected_output="A travel plan string or 'No suggestion'.",
+        ))
 
-    culture_agent = Agent(
-        role="Culture Guide",
-        goal="Extract places from the conversation and provide cultural and general information if travel or locations are mentioned.",
-        backstory="You are a knowledgeable guide sharing insights on history, culture, and tips for destinations.",
-        llm=groq_llm,
-        verbose=True,
-    )
+    # Culture Agent (Groq for factual info)
+    if active_configs.get("culture", {}).get("active", False):
+        agents["culture"] = Agent(
+            role="Culture Guide",
+            goal="Extract places from the conversation and provide cultural and general information if relevant.",
+            backstory="You are a knowledgeable guide sharing insights on history, culture, and tips for destinations.",
+            llm=get_llm(active_configs["culture"]["llm"]),
+            verbose=True,
+        )
+        tasks.append(Task(
+            description=f"Examine this conversation: {conversation}. Extract any places and provide cultural/general info. Output only if relevant, else 'No culture info'.",
+            agent=agents["culture"],
+            expected_output="Cultural info string or 'No suggestion'.",
+        ))
 
-    restaurant_agent = Agent(
-        role="Food Recommender",
-        goal="Detect talks about eating or dining and suggest the best restaurants for the mentioned place.",
-        backstory="You are a gourmet expert recommending top-rated eateries based on user preferences.",
-        llm=groq_llm,
-        verbose=True,
-    )
+    # Restaurant Agent (Gemini for recommendations)
+    if active_configs.get("restaurant", {}).get("active", False):
+        agents["restaurant"] = Agent(
+            role="Food Recommender",
+            goal="Detect talks about eating or dining and suggest the best restaurants if relevant.",
+            backstory="You are a gourmet expert recommending top-rated eateries based on user preferences.",
+            llm=get_llm(active_configs["restaurant"]["llm"]),
+            verbose=True,
+        )
+        tasks.append(Task(
+            description=f"Examine this conversation: {conversation}. If eating/dining is mentioned, suggest top 3 restaurants for the place. Output only if relevant, else 'No restaurant suggestions'.",
+            agent=agents["restaurant"],
+            expected_output="Restaurant list string or 'No suggestion'.",
+        ))
 
-    summarizer_agent = Agent(
+    # Summary Agent (Groq for quick summary, always active)
+    active_configs["summary"] = {"active": True, "llm": "groq"}
+    agents["summary"] = Agent(
         role="Conversation Summarizer",
         goal="Summarize the entire discussion, focusing on key points as if they are 'unread' messages.",
         backstory="You are a concise summarizer who captures the essence of user chats without adding fluff.",
-        llm=gemini_llm,  # Using Gemini for variety/summary
+        llm=get_llm(active_configs["summary"]["llm"]),
         verbose=True,
     )
-
-    # Tasks (each examines the full conversation)
-    travel_task = Task(
-        description=f"Examine this conversation: {conversation}. If travel to a place like Paris is discussed, generate a detailed plan (itinerary, tips). Output only if relevant, else 'No travel suggestion'.",
-        agent=travel_agent,
-        expected_output="A travel plan string or 'No suggestion'.",
-    )
-
-    culture_task = Task(
-        description=f"Examine this conversation: {conversation}. Extract any places and provide cultural/general info. Output only if relevant, else 'No culture info'.",
-        agent=culture_agent,
-        expected_output="Cultural info string or 'No suggestion'.",
-    )
-
-    restaurant_task = Task(
-        description=f"Examine this conversation: {conversation}. If eating/dining is mentioned, suggest top 3 restaurants for the place. Output only if relevant, else 'No restaurant suggestions'.",
-        agent=restaurant_agent,
-        expected_output="Restaurant list string or 'No suggestion'.",
-    )
-
-    summary_task = Task(
+    tasks.append(Task(
         description=f"Summarize this unread discussion: {conversation}. Keep it brief, highlight key topics and decisions.",
-        agent=summarizer_agent,
+        agent=agents["summary"],
         expected_output="A concise summary string.",
-    )
+    ))
 
-    # Crew: Sequential execution for simplicity (agents run in order)
+    # Crew
     crew = Crew(
-        agents=[travel_agent, culture_agent, restaurant_agent, summarizer_agent],
-        tasks=[travel_task, culture_task, restaurant_task, summary_task],
-        verbose=2,  # For logging during dev
+        agents=list(agents.values()),
+        tasks=tasks,
+        verbose=True,
     )
 
     return crew
